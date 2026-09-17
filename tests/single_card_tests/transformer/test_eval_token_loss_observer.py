@@ -46,10 +46,17 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import paddle
+import pytest
 
+import paddlefleet.models.common.language_loss.language_loss as ll
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
 
 IGNORED = -100
+
+
+@pytest.fixture(autouse=True)
+def _default_compatibility_mode(monkeypatch):
+    monkeypatch.setenv("FLAGS_use_accuracy_compatible_kernel", "0")
 
 
 def _make_loss():
@@ -234,6 +241,288 @@ class TestEvalTokenLossObserverFusedPath(unittest.TestCase):
         np.testing.assert_allclose(
             with_hook.numpy(), without.numpy(), rtol=0, atol=0
         )
+
+
+def _real_loss(
+    cls=LanguageLoss,
+    *,
+    experimental=False,
+    fused=False,
+    recomputing=False,
+    added=True,
+    depths=2,
+):
+    """Construct the real layer and CE, with explicit (non-MagicMock) flags."""
+    cfg = types.SimpleNamespace(
+        parallel_output=False,
+        use_accuracy_compatible=False,
+        loss_subbatch_sequence_length=0,
+        sequence_parallel=False,
+        gpt_model_use_experimental_version=experimental,
+        fused_linear_ce_loss_chunk=1 if fused else 0,
+        cp_balance_mode="contiguous_allgather",
+        experimental_dataflow=False,
+        recompute_modules=["loss_fn"] if recomputing else [],
+        recompute_num_layers=-1,
+        num_nextn_predict_layers=depths,
+        mtp_load_weight_only=False,
+        use_erndata=False,
+        train_mtp_only=False,
+        mtp_distillation_loss=False,
+        add_mtp_loss=added,
+        mtp_loss_scaling_factor=0.3,
+    )
+    return cls(cfg, pg_collection=types.SimpleNamespace())
+
+
+def _real_inputs(*, fused=False, depths=2):
+    paddle.seed(20260917)
+    heads, leaves, expected_logits = [], [], []
+    for _ in range(depths + 1):
+        if fused:
+            hidden = paddle.randn([2, 4, 8]) * 0.1
+            weight = paddle.randn([16, 8]) * 0.1
+            bias = paddle.randn([16]) * 0.1
+            for tensor in (hidden, weight, bias):
+                tensor.stop_gradient = False
+            heads.append((hidden, weight, bias))
+            leaves.extend((hidden, weight, bias))
+            expected_logits.append(
+                (
+                    paddle.matmul(hidden, weight, transpose_y=True) + bias
+                ).detach()
+            )
+        else:
+            logits = paddle.randn([2, 4, 16]) * 0.1
+            logits.stop_gradient = False
+            heads.append(logits)
+            leaves.append(logits)
+            expected_logits.append(logits.detach())
+    labels = paddle.to_tensor(
+        [
+            [0, 1, 2, 3, 4, 5][: 4 + depths],
+            [6, -100, 7, -100, 8, -100][: 4 + depths],
+        ],
+        dtype="int64",
+    )
+    return heads, labels, leaves, expected_logits
+
+
+def _save_observations(seen):
+    def observe(loss, labels):
+        seen.append((loss.detach().clone(), labels.detach().clone()))
+
+    return observe
+
+
+@pytest.mark.parametrize("experimental", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("recompute_mode", [None, True, False])
+@pytest.mark.parametrize("added", [False, True])
+def test_real_mtp_forward_backward_observer_contract(
+    experimental, fused, recompute_mode, added
+):
+    """Real CE (including Triton), MTP, autograd and both recompute engines."""
+    results = []
+    original_recompute = ll.recompute
+    for observing in (False, True):
+        layer = _real_loss(
+            experimental=experimental,
+            fused=fused,
+            added=added,
+            recomputing=recompute_mode is not None,
+        )
+        heads, labels, leaves, expected_logits = _real_inputs(fused=fused)
+        seen = []
+        if observing:
+            layer._eval_token_loss_hook = _save_observations(seen)
+        with mock.patch.object(
+            ll,
+            "recompute",
+            side_effect=lambda f, *args: original_recompute(
+                f, *args, use_reentrant=recompute_mode
+            ),
+        ):
+            output = layer.forward(heads, labels)
+            assert len(seen) == (3 if observing else 0)
+            output.backward()
+        assert len(seen) == (3 if observing else 0)
+        results.append(
+            (output.numpy().copy(), [x.grad.numpy().copy() for x in leaves])
+        )
+        for depth, (token_loss, observed_labels) in enumerate(seen):
+            target = labels[:, depth : depth + 4]
+            reference = paddle.nn.functional.cross_entropy(
+                expected_logits[depth], target, reduction="none"
+            ).reshape(target.shape)
+            np.testing.assert_array_equal(
+                observed_labels.numpy(), target.numpy()
+            )
+            np.testing.assert_allclose(
+                token_loss.numpy(), reference.numpy(), rtol=2e-5, atol=2e-6
+            )
+    np.testing.assert_array_equal(results[0][0], results[1][0])
+    for without, with_hook in zip(results[0][1], results[1][1]):
+        np.testing.assert_array_equal(without, with_hook)
+
+
+@pytest.mark.parametrize("experimental", [False, True])
+@pytest.mark.parametrize("fused", [False, True])
+def test_separate_main_and_mtp_heads(experimental, fused):
+    main = _real_loss(
+        ll.MainLanguageLoss,
+        experimental=experimental,
+        fused=fused,
+        recomputing=True,
+    )
+    mtp = _real_loss(
+        ll.MTPLanguageLoss,
+        experimental=experimental,
+        fused=fused,
+        recomputing=True,
+    )
+    heads, labels, _, _ = _real_inputs(fused=fused)
+    main_seen, mtp_seen = [], []
+    main._eval_token_loss_hook = _save_observations(main_seen)
+    mtp._eval_token_loss_hook = _save_observations(mtp_seen)
+    data = mtp.forward({"mtp_logits": heads[1:], "labels": labels})
+    output = main.forward(
+        {"logits": heads[0], "mtp_loss": data["mtp_loss"]}, labels
+    )
+    assert (len(main_seen), len(mtp_seen)) == (1, 2)
+    output.backward()
+    assert (len(main_seen), len(mtp_seen)) == (1, 2)
+    np.testing.assert_array_equal(
+        main_seen[0][1].numpy(), labels[:, :4].numpy()
+    )
+    for depth, (_, target) in enumerate(mtp_seen):
+        np.testing.assert_array_equal(
+            target.numpy(), labels[:, depth + 1 : depth + 5].numpy()
+        )
+
+
+@pytest.mark.parametrize("reentrant", [True, False])
+def test_multiple_pending_microbatches_and_changed_observer(reentrant):
+    layer = _real_loss(recomputing=True, depths=0)
+    original_recompute = ll.recompute
+    first, second, late = [], [], []
+    heads, labels, _, _ = _real_inputs(depths=0)
+    with mock.patch.object(
+        ll,
+        "recompute",
+        side_effect=lambda f, *args: original_recompute(
+            f, *args, use_reentrant=reentrant
+        ),
+    ):
+        layer._eval_token_loss_hook = _save_observations(first)
+        a = layer.forward(heads[0], labels)
+        layer._eval_token_loss_hook = _save_observations(second)
+        b = layer.forward(heads[0] * 2, labels)
+        layer._eval_token_loss_hook = _save_observations(late)
+        (a + b).backward()
+    assert (len(first), len(second), len(late)) == (1, 1, 0)
+    assert not ll._token_loss_replaying.get()
+
+
+def test_observer_added_after_unobserved_forward_is_not_called_by_replay():
+    layer = _real_loss(recomputing=True, depths=0)
+    heads, labels, _, _ = _real_inputs(depths=0)
+    output = layer.forward(heads[0], labels)
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+    output.backward()
+    assert seen == []
+
+
+def test_subbatch_notifies_once_after_all_chunks():
+    layer = _real_loss(depths=0)
+    layer.use_subbatch = True
+    layer.loss_subbatch_sequence_length = 2
+    heads, labels, _, _ = _real_inputs(depths=0)
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+    layer.forward(heads[0], labels).backward()
+    assert len(seen) == 1
+    reference = paddle.nn.functional.cross_entropy(
+        heads[0], labels, reduction="none"
+    )
+    np.testing.assert_allclose(
+        seen[0][0].numpy(), reference.reshape(labels.shape).numpy()
+    )
+
+
+def test_distillation_observes_main_ce_only():
+    layer = _real_loss(recomputing=True)
+    layer.config.mtp_distillation_loss = True
+    heads, labels, _, expected_logits = _real_inputs()
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+    layer.forward(heads, labels).backward()
+    assert len(seen) == 1
+    reference = paddle.nn.functional.cross_entropy(
+        expected_logits[0], labels[:, :4], reduction="none"
+    ).reshape([2, 4])
+    np.testing.assert_allclose(seen[0][0].numpy(), reference.numpy())
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_all_masked_main_and_mtp_still_notify(fused):
+    layer = _real_loss(experimental=True, fused=fused)
+    heads, labels, _, _ = _real_inputs(fused=fused)
+    labels[:] = -100
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+    output = layer.forward(heads, labels)
+    output.backward()
+    assert len(seen) == 3
+    assert float(output) == 0.0
+    assert all(list(loss.shape) == [2, 4] for loss, _ in seen)
+
+
+def test_observer_failure_does_not_poison_next_forward():
+    layer = _real_loss(recomputing=True, depths=0)
+    heads, labels, _, _ = _real_inputs(depths=0)
+
+    def fail(*args):
+        raise RuntimeError("observer failure")
+
+    layer._eval_token_loss_hook = fail
+    with pytest.raises(RuntimeError, match="observer failure"):
+        layer.forward(heads[0], labels)
+    assert not ll._token_loss_replaying.get()
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+    layer.forward(heads[0], labels).backward()
+    assert len(seen) == 1
+
+
+def test_experimental_nonfused_mtp_observes_after_cp_gather():
+    """Check gather placement only; communication itself is mocked here."""
+    layer = _real_loss(experimental=True)
+    heads, labels, _, _ = _real_inputs()
+    seen = []
+    layer._eval_token_loss_hook = _save_observations(seen)
+
+    def gather(value, **kwargs):
+        return paddle.concat([value, value], axis=1)
+
+    with (
+        mock.patch.object(
+            ll, "get_context_parallel_world_size", return_value=2
+        ),
+        mock.patch.object(
+            ll.ContextParallelScatterOp, "apply", side_effect=lambda x, **kw: x
+        ),
+        mock.patch.object(
+            ll.ContextParallelGatherOp, "apply", side_effect=gather
+        ),
+    ):
+        layer.forward(heads, labels)
+    assert len(seen) == 3
+    for depth, (loss, target) in enumerate(seen):
+        assert list(loss.shape) == [2, 8]
+        expected = paddle.concat([labels[:, depth : depth + 4]] * 2, axis=1)
+        np.testing.assert_array_equal(target.numpy(), expected.numpy())
 
 
 if __name__ == "__main__":
